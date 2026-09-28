@@ -475,10 +475,25 @@ fn update_allocation_sizes<P: Platform>(layout: &mut Layout<P>) {
 fn update_file_offset<P: Platform>(layout: &mut Layout<P>) -> Result {
     timing_phase!("Update file offsets post-compression");
 
-    // Recalculate file offsets since we changed file_sizes
+    // Recalculate file offsets since we changed file_sizes. Only non-alloc debug sections shrink,
+    // so every section before the first compressed one keeps its original offset. Recomputing
+    // those from scratch would also drop the padding that keeps each loadable segment's file
+    // offset congruent with its address, shifting a writable segment's contents in the file.
     let mut segments = layout.segment_layouts.segments.iter().peekable();
     let mut file_offset = 0;
+    let mut recomputing = false;
     for event in &layout.output_order {
+        if let OrderEvent::Section(section_id) = event
+            && !recomputing
+        {
+            if layout.compressed_debug_sections.get(section_id).is_none() {
+                let section_layout = layout.section_layouts.get(section_id);
+                file_offset =
+                    file_offset.max(section_layout.file_offset + section_layout.file_size);
+                continue;
+            }
+            recomputing = true;
+        }
         match event {
             OrderEvent::SegmentStart(program_segment_id)
                 if segments.peek().is_some_and(|s| s.id == program_segment_id) =>
