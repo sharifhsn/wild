@@ -731,6 +731,27 @@ pub fn store_file_name(path: &Path) -> io::Result<String> {
         .ok_or_else(|| invalid("compact object path has no UTF-8 file name"))
 }
 
+/// Stores `data` unchanged under its content hash, as `<hash>.o`. Used when objects must stay
+/// ordinary ELF that any linker can read; sharing by hash still keeps one copy of each object.
+pub fn store_raw_object(data: &[u8], store: &Path) -> io::Result<PathBuf> {
+    let key = blake3::hash(data).to_hex();
+    fs::create_dir_all(store)?;
+    let path = store.join(format!("{key}.o"));
+    match fs::metadata(&path) {
+        // Content addressing makes an existing entry of the right size the same object.
+        Ok(existing) if existing.len() == data.len() as u64 => {}
+        Ok(_) => {
+            return Err(invalid(
+                "existing object does not match its content address",
+            ));
+        }
+        // Concurrent writers have identical bytes and unique scratch names.
+        Err(error) if error.kind() == io::ErrorKind::NotFound => atomic_write(&path, data)?,
+        Err(error) => return Err(error),
+    }
+    Ok(path)
+}
+
 pub fn relative_path(path: &Path, base: &Path) -> io::Result<String> {
     let path = fs::canonicalize(path)?;
     let base = fs::canonicalize(base)?;
