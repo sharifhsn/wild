@@ -43,6 +43,11 @@ static BLOCKS: AtomicU64 = AtomicU64::new(0);
 static READ_BLOCKS: AtomicU64 = AtomicU64::new(0);
 static CACHE_EVICTIONS: AtomicU64 = AtomicU64::new(0);
 static CACHE_ADVISED_BYTES: AtomicU64 = AtomicU64::new(0);
+// Objects with payload blocks, none of which has been read yet. An object leaves these
+// counters when its first block is read, so they are exact whenever statistics print.
+static UNREAD_OBJECTS: AtomicU64 = AtomicU64::new(0);
+static UNREAD_METADATA_BYTES: AtomicU64 = AtomicU64::new(0);
+static UNREAD_PAYLOAD_BYTES: AtomicU64 = AtomicU64::new(0);
 static CACHE_LIMIT: OnceLock<Option<usize>> = OnceLock::new();
 static DECODED_CACHE: OnceLock<Mutex<DecodedCache>> = OnceLock::new();
 
@@ -53,7 +58,7 @@ pub fn statistics() -> String {
         .unwrap_or(0);
     let cache_limit = decoded_cache_limit();
     format!(
-        "{{\"objects\":{},\"raw_bytes\":{},\"stored_bytes\":{},\"metadata_bytes\":{},\"payload_bytes\":{},\"decoded_bytes\":{},\"blocks\":{},\"read_blocks\":{},\"cache_enabled\":{},\"cache_limit_bytes\":{},\"cache_tracked_bytes\":{},\"cache_evictions\":{},\"cache_advised_bytes\":{}}}",
+        "{{\"objects\":{},\"raw_bytes\":{},\"stored_bytes\":{},\"metadata_bytes\":{},\"payload_bytes\":{},\"decoded_bytes\":{},\"blocks\":{},\"read_blocks\":{},\"cache_enabled\":{},\"cache_limit_bytes\":{},\"cache_tracked_bytes\":{},\"cache_evictions\":{},\"cache_advised_bytes\":{},\"unread_objects\":{},\"unread_metadata_bytes\":{},\"unread_payload_bytes\":{}}}",
         OBJECTS.load(Ordering::Relaxed),
         RAW_BYTES.load(Ordering::Relaxed),
         STORED_BYTES.load(Ordering::Relaxed),
@@ -66,7 +71,10 @@ pub fn statistics() -> String {
         cache_limit.unwrap_or(0),
         cache_bytes,
         CACHE_EVICTIONS.load(Ordering::Relaxed),
-        CACHE_ADVISED_BYTES.load(Ordering::Relaxed)
+        CACHE_ADVISED_BYTES.load(Ordering::Relaxed),
+        UNREAD_OBJECTS.load(Ordering::Relaxed),
+        UNREAD_METADATA_BYTES.load(Ordering::Relaxed),
+        UNREAD_PAYLOAD_BYTES.load(Ordering::Relaxed)
     )
 }
 
@@ -278,6 +286,7 @@ pub struct CompactObject {
     sections: Vec<Section>,
     blocks: Vec<Block>,
     original_len: u64,
+    payload_read: std::sync::atomic::AtomicBool,
 }
 
 fn invalid(message: impl Into<String>) -> io::Error {
@@ -447,12 +456,32 @@ impl CompactObject {
             Ordering::Relaxed,
         );
         BLOCKS.fetch_add(blocks.len() as u64, Ordering::Relaxed);
+        if !blocks.is_empty() {
+            UNREAD_OBJECTS.fetch_add(1, Ordering::Relaxed);
+            UNREAD_METADATA_BYTES.fetch_add(metadata.len() as u64, Ordering::Relaxed);
+            UNREAD_PAYLOAD_BYTES.fetch_add(
+                blocks.iter().map(|b| b.raw_len as u64).sum(),
+                Ordering::Relaxed,
+            );
+        }
         Ok(Self {
             metadata,
             sections,
             blocks,
             original_len: u64_at(data, 16)?,
+            payload_read: std::sync::atomic::AtomicBool::new(false),
         })
+    }
+
+    fn note_payload_read(&self) {
+        if !self.payload_read.swap(true, Ordering::Relaxed) {
+            UNREAD_OBJECTS.fetch_sub(1, Ordering::Relaxed);
+            UNREAD_METADATA_BYTES.fetch_sub(self.metadata.len() as u64, Ordering::Relaxed);
+            UNREAD_PAYLOAD_BYTES.fetch_sub(
+                self.blocks.iter().map(|b| b.raw_len as u64).sum(),
+                Ordering::Relaxed,
+            );
+        }
     }
 
     pub fn metadata(&self) -> &[u8] {
@@ -486,6 +515,7 @@ impl CompactObject {
                 .verified
                 .get_or_init(|| {
                     READ_BLOCKS.fetch_add(1, Ordering::Relaxed);
+                    self.note_payload_read();
                     if blake3::hash(stored).as_bytes() == &block.digest {
                         Ok(())
                     } else {
@@ -500,6 +530,7 @@ impl CompactObject {
                 .decoded
                 .get_or_init(|| {
                     READ_BLOCKS.fetch_add(1, Ordering::Relaxed);
+                    self.note_payload_read();
                     DECODED_BYTES.fetch_add(block.raw_len as u64, Ordering::Relaxed);
                     if decoded_cache_limit().is_some() {
                         decode_to_mmap(stored, block.raw_len, &block.digest)
