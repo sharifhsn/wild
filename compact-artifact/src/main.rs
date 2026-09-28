@@ -49,6 +49,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             )?;
             println!("{{\"members\":{count}}}");
         }
+        Some("dwo-fixup") if args.len() >= 2 => {
+            for path in &args[1..] {
+                if compact_artifact::dwo::make_readable_by_bfd(Path::new(path))? {
+                    println!("rewrote {path}");
+                }
+            }
+        }
         Some("inspect") if args.len() == 2 => {
             let bytes = std::fs::read(&args[1])?;
             let reader = CompactObject::parse(&bytes)?;
@@ -63,7 +70,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         _ => {
             return Err(
-                "usage: wild-pack object INPUT OUTPUT | archive INPUT OUTPUT STORE | inspect INPUT | references MANIFEST"
+                "usage: wild-pack object INPUT OUTPUT | archive INPUT OUTPUT STORE | inspect INPUT | references MANIFEST | dwo-fixup DWO..."
                     .into(),
             );
         }

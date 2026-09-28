@@ -22,6 +22,7 @@ use std::sync::Weak;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
 
+pub mod dwo;
 pub mod library;
 
 pub const MAGIC: &[u8; 8] = b"RCOBJ001";
