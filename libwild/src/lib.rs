@@ -158,6 +158,8 @@ pub struct Linker<F: FileSystem = OsFileSystem> {
     /// We store our input files here once we've read them.
     inputs_arena: Arena<input_data::InputFile<F::Input>>,
 
+    compact_arena: Arena<compact_artifact::CompactObject>,
+
     linker_plugin_arena: Arena<linker_plugins::LoadedPlugin>,
 
     /// Anything that doesn't need a custom Drop implementation can go in here. In practice, it's
@@ -203,6 +205,7 @@ impl<F: FileSystem> Linker<F> {
         Self {
             file_system: std::sync::Arc::new(file_system),
             inputs_arena: Arena::new(),
+            compact_arena: Arena::new(),
             linker_plugin_arena: Arena::new(),
             herd: Default::default(),
             shutdown_scope: Default::default(),
@@ -266,6 +269,7 @@ impl<F: FileSystem> Linker<F> {
     ) -> error::Result<LinkerOutput<'data>> {
         let mut file_loader = input_data::FileLoader::new(
             &self.inputs_arena,
+            &self.compact_arena,
             std::sync::Arc::clone(&self.file_system),
         );
 
@@ -404,6 +408,9 @@ impl<F: FileSystem> Linker<F> {
         )?;
 
         P::write_output_file::<A, F>(&output, &layout)?;
+        if std::env::var_os("WILD_COMPACT_STATS").is_some() {
+            eprintln!("WILD_COMPACT_STATS {}", compact_artifact::statistics());
+        }
         diff::maybe_diff()?;
 
         // We've finished linking. We consider everything from this point onwards as shutdown.
@@ -433,6 +440,7 @@ impl<F: FileSystem> Drop for Linker<F> {
     fn drop(&mut self) {
         timing_phase!("Drop inputs");
         self.inputs_arena = Arena::new();
+        self.compact_arena = Arena::new();
         self.herd = Default::default();
     }
 }

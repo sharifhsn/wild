@@ -500,6 +500,8 @@ pub(crate) struct File<'data, C: ElfClass> {
     #[debug(skip)]
     pub(crate) data: &'data [u8],
     #[debug(skip)]
+    compact: Option<crate::input_data::CompactInput<'data>>,
+    #[debug(skip)]
     pub(crate) sections: SectionTable<'data, C>,
     /// This may be symtab or dynsym depending on the file type.
     #[debug(skip)]
@@ -3080,6 +3082,24 @@ fn load_glibc_abi_dt_relr_version<C: ElfClass>(
 }
 
 impl<'data, C: ElfClass> File<'data, C> {
+    fn compression_header(
+        &self,
+        section: &SectionHeader<C>,
+    ) -> Result<Option<(&'data CompressionHeaderEntry<C>, u64, u64)>> {
+        // Inspect the flag without reading a cold block. Most sections are stored
+        // in our compact container but do not themselves use ELF compression.
+        if !section
+            .sh_flags(LittleEndian)
+            .contains(object::elf::SHF_COMPRESSED)
+        {
+            return Ok(None);
+        }
+        let data = self.raw_section_data(section)?;
+        let mut section = *section;
+        section.set_offset(0)?;
+        Ok(section.compression(LittleEndian, data)?)
+    }
+
     fn parse_elf_bytes(data: &'data [u8], is_dynamic: bool) -> Result<Self> {
         let header = C::FileHeader::parse(data)?;
         let endian = header.endian()?;
@@ -3125,6 +3145,7 @@ impl<'data, C: ElfClass> File<'data, C> {
         Ok(Self {
             arch: architecture,
             data,
+            compact: None,
             sections,
             symbols,
             versym,
@@ -3143,7 +3164,8 @@ impl<'data, C: ElfClass> platform::ObjectFile<'data> for File<'data, C> {
     fn parse(input: &InputBytes<'data>, args: &ElfArgs) -> Result<Self> {
         let is_dynamic = input.kind == FileKind::ElfDynamic;
 
-        let file = Self::parse_bytes(input.data, is_dynamic)?;
+        let mut file = Self::parse_bytes(input.data, is_dynamic)?;
+        file.compact = input.compact;
 
         if file.arch != args.architecture() {
             bail!(
@@ -3182,6 +3204,15 @@ impl<'data, C: ElfClass> platform::ObjectFile<'data> for File<'data, C> {
     }
 
     fn raw_section_data(&self, section: &SectionHeader<C>) -> Result<&'data [u8]> {
+        let offset: u64 = section.sh_offset(LittleEndian).into();
+        if let Some(compact) = self.compact
+            && offset & compact_artifact::VIRTUAL_OFFSET != 0
+        {
+            return Ok(compact.object.read_section(
+                compact.source,
+                (offset & !compact_artifact::VIRTUAL_OFFSET) as usize,
+            )?);
+        }
         Ok(section.data(LittleEndian, self.data)?)
     }
 
@@ -3191,12 +3222,12 @@ impl<'data, C: ElfClass> platform::ObjectFile<'data> for File<'data, C> {
         member: &bumpalo_herd::Member<'data>,
         loaded_metrics: &LoadedMetrics,
     ) -> Result<&'data [u8]> {
-        let data = section.data(LittleEndian, self.data)?;
+        let data = self.raw_section_data(section)?;
         loaded_metrics
             .loaded_bytes
             .fetch_add(data.len(), Ordering::Relaxed);
 
-        if let Some((compression, _, _)) = section.compression(LittleEndian, self.data)? {
+        if let Some((compression, _, _)) = self.compression_header(section)? {
             loaded_metrics
                 .loaded_compressed_bytes
                 .fetch_add(data.len(), Ordering::Relaxed);
@@ -3217,9 +3248,9 @@ impl<'data, C: ElfClass> platform::ObjectFile<'data> for File<'data, C> {
     }
 
     fn copy_section_data(&self, section: &SectionHeader<C>, out: &mut [u8]) -> Result {
-        let data = section.data(LittleEndian, self.data)?;
+        let data = self.raw_section_data(section)?;
 
-        if let Some((compression, _, _)) = section.compression(LittleEndian, self.data)? {
+        if let Some((compression, _, _)) = self.compression_header(section)? {
             decompress_into(
                 compression,
                 &data[size_of::<CompressionHeaderEntry<C>>()..],
@@ -3232,9 +3263,9 @@ impl<'data, C: ElfClass> platform::ObjectFile<'data> for File<'data, C> {
     }
 
     fn section_data_cow(&self, section: &SectionHeader<C>) -> Result<Cow<'data, [u8]>> {
-        let data = section.data(LittleEndian, self.data)?;
+        let data = self.raw_section_data(section)?;
 
-        if let Some((compression, _, _)) = section.compression(LittleEndian, self.data)? {
+        if let Some((compression, _, _)) = self.compression_header(section)? {
             let len = self.section_size(section)?;
             let mut decompressed = vec![0; len as usize];
             decompress_into(
@@ -3249,14 +3280,14 @@ impl<'data, C: ElfClass> platform::ObjectFile<'data> for File<'data, C> {
     }
 
     fn section_size(&self, section: &SectionHeader<C>) -> Result<u64> {
-        Ok(section.compression(LittleEndian, self.data)?.map_or_else(
+        Ok(self.compression_header(section)?.map_or_else(
             || section.sh_size(LittleEndian).into(),
             |compression| compression.0.ch_size(LittleEndian).into(),
         ))
     }
 
     fn section_alignment(&self, section: &SectionHeader<C>) -> Result<u64> {
-        Ok(section.compression(LittleEndian, self.data)?.map_or_else(
+        Ok(self.compression_header(section)?.map_or_else(
             || section.sh_addralign(LittleEndian).into(),
             |compression| compression.0.ch_addralign(LittleEndian).into(),
         ))
@@ -3271,15 +3302,16 @@ impl<'data, C: ElfClass> platform::ObjectFile<'data> for File<'data, C> {
             return Ok(RelocationList::Rela(&[]));
         };
         let section = self.sections.section(section_index)?;
-        Ok(
-            if let Some((rela, _)) = section.rela(LittleEndian, self.data)? {
-                RelocationList::Rela(rela)
-            } else if let Some((crel, _)) = section.crel(LittleEndian, self.data)? {
-                RelocationList::Crel(crel)
-            } else {
-                RelocationList::Rela(&[])
-            },
-        )
+        let data = self.raw_section_data(section)?;
+        let mut section = *section;
+        section.set_offset(0)?;
+        Ok(if let Some((rela, _)) = section.rela(LittleEndian, data)? {
+            RelocationList::Rela(rela)
+        } else if let Some((crel, _)) = section.crel(LittleEndian, data)? {
+            RelocationList::Crel(crel)
+        } else {
+            RelocationList::Rela(&[])
+        })
     }
 
     fn symbol(&self, index: object::SymbolIndex) -> Result<&SymtabEntry<C>> {

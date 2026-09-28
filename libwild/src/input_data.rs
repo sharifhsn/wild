@@ -50,6 +50,8 @@ pub(crate) struct FileLoader<'data, F: FileSystem> {
 
     inputs_arena: &'data Arena<InputFile<F::Input>>,
 
+    compact_arena: &'data Arena<compact_artifact::CompactObject>,
+
     // File system used for reading and writing of the data.
     file_system: Arc<F>,
 }
@@ -78,6 +80,13 @@ pub(crate) struct InputBytes<'data> {
     pub(crate) kind: FileKind,
     pub(crate) data: &'data [u8],
     pub(crate) modifiers: Modifiers,
+    pub(crate) compact: Option<CompactInput<'data>>,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct CompactInput<'data> {
+    pub(crate) object: &'data compact_artifact::CompactObject,
+    pub(crate) source: &'data [u8],
 }
 
 #[derive(Clone, Copy)]
@@ -180,6 +189,8 @@ struct TemporaryState<'data, P: Platform, F: FileSystem> {
 
     inputs_arena: &'data Arena<InputFile<F::Input>>,
 
+    compact_arena: &'data Arena<compact_artifact::CompactObject>,
+
     file_system: Arc<F>,
 }
 
@@ -280,11 +291,13 @@ impl<'data> AuxiliaryFiles<'data> {
 impl<'data, F: FileSystem> FileLoader<'data, F> {
     pub(crate) fn new(
         inputs_arena: &'data Arena<InputFile<F::Input>>,
+        compact_arena: &'data Arena<compact_artifact::CompactObject>,
         file_system: Arc<F>,
     ) -> Self {
         Self {
             loaded_files: Vec::new(),
             inputs_arena,
+            compact_arena,
             file_system,
             has_dynamic: false,
         }
@@ -325,6 +338,7 @@ impl<'data, F: FileSystem> FileLoader<'data, F> {
             next_file_load_index: AtomicUsize::new(initial_work.len()),
             files: SegQueue::new(),
             inputs_arena: self.inputs_arena,
+            compact_arena: self.compact_arena,
             file_system: Arc::clone(&self.file_system),
         };
 
@@ -558,12 +572,24 @@ fn process_thin_archive<'data, P: Platform, F: FileSystem>(
 
     // Collect thin-member paths first.
     let mut entry_paths = Vec::new();
-    for entry in ArchiveIterator::from_archive_bytes(input_file.data())? {
-        match entry? {
-            ArchiveEntry::Thin(entry) => {
-                entry_paths.push(parent_path.join(entry.ident.as_path()));
+    if input_file
+        .data()
+        .starts_with(compact_artifact::library::MAGIC)
+    {
+        let library = compact_artifact::library::Library::parse(input_file.data())?;
+        for member in library.members {
+            if member.kind != 2 {
+                entry_paths.push(parent_path.join(member.path));
             }
-            ArchiveEntry::Regular(_) => {}
+        }
+    } else {
+        for entry in ArchiveIterator::from_archive_bytes(input_file.data())? {
+            match entry? {
+                ArchiveEntry::Thin(entry) => {
+                    entry_paths.push(parent_path.join(entry.ident.as_path()));
+                }
+                ArchiveEntry::Regular(_) => {}
+            }
         }
     }
 
@@ -695,7 +721,9 @@ impl<'data, P: Platform, F: FileSystem> TemporaryState<'data, P, F> {
 
         match kind {
             FileKind::Archive => process_archive(input_file, &input_ref, file.as_ref(), self),
-            FileKind::ThinArchive => process_thin_archive(input_file, self),
+            FileKind::ThinArchive | FileKind::CompactLibrary => {
+                process_thin_archive(input_file, self)
+            }
             FileKind::Text => {
                 let script =
                     process_linker_script(input_file, self.args, self.file_system.as_ref())?;
@@ -784,9 +812,23 @@ impl<'data, P: Platform, F: FileSystem> TemporaryState<'data, P, F> {
         &self,
         input_ref: InputRef<'data>,
         file: Option<&Arc<std::fs::File>>,
-        kind: FileKind,
+        mut kind: FileKind,
     ) -> Result<InputRecord<'data, P>> {
-        let data = input_ref.data();
+        let mut data = input_ref.data();
+        let compact = if kind == FileKind::CompactElf {
+            let object = &*self
+                .compact_arena
+                .alloc(compact_artifact::CompactObject::parse(data)?);
+            let compact = CompactInput {
+                object,
+                source: data,
+            };
+            data = object.metadata();
+            kind = FileKind::ElfObject;
+            Some(compact)
+        } else {
+            None
+        };
 
         // The plugin API docs say to pass files to the plugin before the linker tries to identify
         // the them. Unfortunately the plugin API doesn't provide a fast way to identify files. The
@@ -813,6 +855,7 @@ impl<'data, P: Platform, F: FileSystem> TemporaryState<'data, P, F> {
             input: input_ref,
             data,
             modifiers: input_ref.file.modifiers,
+            compact,
         };
 
         let object = InputRecord::Object(ParsedInputObject::new(&input_bytes, self.args));

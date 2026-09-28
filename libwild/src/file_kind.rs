@@ -16,6 +16,8 @@ use zerocopy::IntoBytes;
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
 pub(crate) enum FileKind {
     ElfObject,
+    CompactElf,
+    CompactLibrary,
     ElfDynamic,
     MachOObject,
     MachODylib,
@@ -31,7 +33,11 @@ pub(crate) enum FileKind {
 
 impl FileKind {
     pub(crate) fn identify_bytes(bytes: &[u8]) -> Result<FileKind> {
-        if bytes.starts_with(&object::archive::MAGIC) {
+        if bytes.starts_with(compact_artifact::MAGIC) {
+            Ok(FileKind::CompactElf)
+        } else if bytes.starts_with(compact_artifact::library::MAGIC) {
+            Ok(FileKind::CompactLibrary)
+        } else if bytes.starts_with(&object::archive::MAGIC) {
             Ok(FileKind::Archive)
         } else if bytes.starts_with(&object::archive::THIN_MAGIC) {
             Ok(FileKind::ThinArchive)
@@ -159,6 +165,8 @@ impl std::fmt::Display for FileKind {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let s = match self {
             FileKind::ElfObject => "ELF object",
+            FileKind::CompactElf => "compact ELF object",
+            FileKind::CompactLibrary => "compact library manifest",
             FileKind::ElfDynamic => "ELF dynamic",
             FileKind::MachOObject => "Mach-O object",
             FileKind::MachODylib => "Mach-O dylib",

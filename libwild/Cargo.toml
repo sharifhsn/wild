@@ -8,6 +8,7 @@ rust-version.workspace = true
 edition.workspace = true
 
 [dependencies]
+compact-artifact = { path = "../compact-artifact" }
 linker-layout = { path = "../linker-layout", version = "0.10.0" }
 linker-trace = { path = "../linker-trace", version = "0.10.0" }
 linker-utils = { path = "../linker-utils", version = "0.10.0" }
