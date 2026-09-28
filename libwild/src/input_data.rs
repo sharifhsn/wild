@@ -577,9 +577,10 @@ fn process_thin_archive<'data, P: Platform, F: FileSystem>(
         .starts_with(compact_artifact::library::MAGIC)
     {
         let library = compact_artifact::library::Library::parse(input_file.data())?;
-        for member in library.members {
+        let paths = library.member_paths(&absolute_path)?;
+        for (member, path) in library.members.iter().zip(paths) {
             if member.kind != 2 {
-                entry_paths.push(parent_path.join(member.path));
+                entry_paths.push(path);
             }
         }
     } else {

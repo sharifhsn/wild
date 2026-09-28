@@ -22,8 +22,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let path = Path::new(&args[1]);
             let library = compact_artifact::library::Library::parse(&std::fs::read(path)?)?;
             let mut stdout = std::io::stdout().lock();
-            for member in library.members {
-                let resolved = path.parent().unwrap_or(Path::new(".")).join(member.path);
+            for resolved in library.member_paths(path)? {
                 stdout.write_all(resolved.to_str().ok_or("non-UTF8 path")?.as_bytes())?;
                 stdout.write_all(&[0])?;
             }

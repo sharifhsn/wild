@@ -6,6 +6,8 @@
 //! `WILD_COMPACT_CACHE_BYTES` enables a file-backed, bounded resident-page mode.
 
 use hashbrown::HashMap;
+use memmap2::Mmap;
+use memmap2::MmapOptions;
 use std::collections::VecDeque;
 use std::fs;
 use std::io;
@@ -19,9 +21,6 @@ use std::sync::OnceLock;
 use std::sync::Weak;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
-
-use memmap2::Mmap;
-use memmap2::MmapOptions;
 
 pub mod library;
 
@@ -692,6 +691,14 @@ pub fn store_object(data: &[u8], store: &Path, options: Options) -> io::Result<P
     Ok(path)
 }
 
+/// The name under which `store_object` published `path` inside its store.
+pub fn store_file_name(path: &Path) -> io::Result<String> {
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .map(str::to_owned)
+        .ok_or_else(|| invalid("compact object path has no UTF-8 file name"))
+}
+
 pub fn relative_path(path: &Path, base: &Path) -> io::Result<String> {
     let path = fs::canonicalize(path)?;
     let base = fs::canonicalize(base)?;
@@ -785,7 +792,17 @@ pub fn pack_archive(
             .filter(|p| !p.as_os_str().is_empty())
             .unwrap_or(Path::new(".")),
     )?;
-    let mut library = library::Library::default();
+    fs::create_dir_all(store)?;
+    let mut library = library::Library {
+        store: relative_path(
+            store,
+            output
+                .parent()
+                .filter(|p| !p.as_os_str().is_empty())
+                .unwrap_or(Path::new(".")),
+        )?,
+        ..Default::default()
+    };
     for member in archive.members() {
         let member = member.map_err(|e| invalid(e.to_string()))?;
         let bytes = member
@@ -795,13 +812,7 @@ pub fn pack_archive(
         library.members.push(library::Member {
             name: String::from_utf8(member.name().to_vec())
                 .map_err(|_| invalid("non-UTF8 member name"))?,
-            path: relative_path(
-                &path,
-                output
-                    .parent()
-                    .filter(|p| !p.as_os_str().is_empty())
-                    .unwrap_or(Path::new(".")),
-            )?,
+            path: store_file_name(&path)?,
             kind: 1,
         });
     }
@@ -847,12 +858,13 @@ mod tests {
         let manifest = library::Library {
             metadata: "../crate.rmeta".into(),
             link_metadata: vec![1, 2, 3],
+            store: ".".into(),
             members: paths
                 .iter()
                 .enumerate()
                 .map(|(i, p)| library::Member {
                     name: format!("object-{i}.o"),
-                    path: p.to_str().unwrap().into(),
+                    path: store_file_name(p).unwrap(),
                     kind: 0,
                 })
                 .collect(),
@@ -863,6 +875,8 @@ mod tests {
         let loaded = library::Library::parse(&bytes).unwrap();
         assert_eq!(loaded.metadata, manifest.metadata);
         assert_eq!(loaded.link_metadata, manifest.link_metadata);
+        assert_eq!(loaded.store, manifest.store);
+        assert_eq!(loaded.member_paths(&path).unwrap(), paths);
         assert_eq!(
             loaded.members.iter().map(|m| &m.name).collect::<Vec<_>>(),
             manifest.members.iter().map(|m| &m.name).collect::<Vec<_>>()
