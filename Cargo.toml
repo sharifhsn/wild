@@ -1,5 +1,6 @@
 [workspace]
 members = [
+  "compact-artifact",
   "linker-diff",
   "linker-layout",
   "linker-trace",
