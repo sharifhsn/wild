@@ -1,3 +1,9 @@
+## Compact Rust artifact experiment
+
+Read [the format, results, and compiler links](TARGET-SIZE.md).
+
+---
+
 # Wild linker
 
 ![Wild logo - drawing of rusty chain links with vines](/images/wild.png)
